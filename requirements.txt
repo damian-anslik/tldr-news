@@ -1,0 +1,3 @@
+supabase==2.3.4
+openai==1.10.0
+newspaper3k==0.2.8
