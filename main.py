@@ -1,46 +1,31 @@
 import streamlit as st
 import validators
 import newspaper
-import datetime
 import supabase
-import requests
 import logging
 import openai
-import json
 
 logger = logging.getLogger(__name__)
-
-
-def parse_generated_summary(raw_response: str) -> dict:
-    response = raw_response.strip("`").replace("json", "").strip()
-    try:
-        return json.loads(response)
-    except:
-        return {}
-
-
-def generate_summary(article_text: str, article_title: str, model_config: dict) -> dict:
-    openai_client = openai.OpenAI(api_key=model_config["OPENAI_API_KEY"])
-    with open("system_prompt.txt", "r") as f:
-        system_prompt = f.read()
-    completion_response = openai_client.chat.completions.create(
-        model=model_config["OPENAI_COMPLETIONS_MODEL"],
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": json.dumps({"title": article_title, "text": article_text}),
-            },
-        ],
-    )
-    formatted_completion_content = parse_generated_summary(
-        completion_response.choices[0].message.content
-    )
-    if not formatted_completion_content:
-        raise Exception(
-            f"Failed to generate summary: {completion_response.choices[0].message.content}"
-        )
-    return formatted_completion_content
+strings = {
+    "APP_NAME": "🤖 TLDR.ai",
+    "APP_DESCRIPTION": "Welcome to TLDR.ai! Simply enter a URL to start chatting with any news article, blog post, or documentation.",
+    "RECENT_CHATS_HEADER": "Recent Chats",
+    "CHAT_INPUT_PLACEHOLDER": "Enter a question or message...",
+    "NEW_CHAT_BUTTON_LABEL": "New Chat",
+    "NEW_CHAT_INPUT_PLACEHOLDER": "Enter a URL to start a new chat...",
+    "NEW_CHAT_TITLE": "Create a new chat",
+    "INVALID_URL_MESSAGE": "Please enter a valid URL.",
+}
+app_config = {
+    "OPENAI_API_KEY": st.secrets["OPENAI_API_KEY"],
+    "OPENAI_COMPLETIONS_MODEL": st.secrets["OPENAI_COMPLETIONS_MODEL"],
+    "SUPABASE_PROJECT_URL": st.secrets["SUPABASE_PROJECT_URL"],
+    "SUPABASE_API_KEY": st.secrets["SUPABASE_API_KEY"],
+}
+db_client = supabase.Client(
+    supabase_url=st.secrets["SUPABASE_PROJECT_URL"],
+    supabase_key=st.secrets["SUPABASE_API_KEY"],
+)
 
 
 def download_article(url: str) -> dict:
@@ -50,8 +35,11 @@ def download_article(url: str) -> dict:
     filtered_keywords = [
         "The Explainer",
     ]
-    if any(keyword in article.text for keyword in filtered_keywords):
-        raise Exception("Article is not supported - contains filtered keywords.")
+    for keyword in filtered_keywords:
+        if keyword in article.text:
+            raise Exception(
+                f"Article is not supported - contains filtered keyword: {keyword}."
+            )
     return {
         "url": article.url,
         "title": article.title,
@@ -59,114 +47,169 @@ def download_article(url: str) -> dict:
     }
 
 
-def get_article(url: str, app_config: dict) -> dict:
-    db_client = supabase.Client(
-        supabase_url=app_config["SUPABASE_PROJECT_URL"],
-        supabase_key=app_config["SUPABASE_API_KEY"],
-    )
-    articles = db_client.table("articles")
-    existing_articles = articles.select("*").eq("url", url).execute()
-    if len(existing_articles.data) > 0:
-        return existing_articles.data[0]
-    model_config = {
-        "OPENAI_API_KEY": app_config["OPENAI_API_KEY"],
-        "OPENAI_COMPLETIONS_MODEL": app_config["OPENAI_COMPLETIONS_MODEL"],
-    }
-    try:
-        article = download_article(url)
-    except Exception as e:
-        db_client.table("failing-articles").insert({"url": url}).execute()
-        logger.error(f"Failed to download article - {str(e)}")
-        raise
-    try:
-        generated_summary = generate_summary(
-            article_text=article["text"],
-            article_title=article["title"],
-            model_config=model_config,
-        )
-    except Exception as e:
-        logger.error(f"Failed to generate article summary - {str(e)}")
-        raise
-    inserted_article_data = {
-        **article,
-        "summary": generated_summary["summary"],
-    }
-    related_articles = get_related_articles(
-        article_keywords=generated_summary["keywords"],
-        from_date=datetime.datetime.now() - datetime.timedelta(hours=72),
-        api_key=app_config["NEWSAPI_API_KEY"],
-    )
-    inserted_article_data["related_articles"] = related_articles
-    articles.insert(inserted_article_data).execute()
-    return inserted_article_data
-
-
-def get_related_articles(
-    article_keywords: list[str],
-    from_date: datetime.datetime,
+def generate_chat_completion(
+    context: str,
+    question: str,
     api_key: str,
-    limit: int = 5,
-) -> list[dict]:
-    query_string = " ".join(article_keywords)
-    from_date_string = from_date.date().strftime("%Y-%m-%d")
-    response = requests.get(
-        url="https://newsapi.org/v2/everything",
-        params={
-            "q": query_string,
-            "from": from_date_string,
-            "pageSize": limit,
-            "page": 1,
-        },
-        headers={"X-Api-Key": api_key},
+    completion_model: str,
+    previous_messages: list[dict] = [],
+) -> dict:
+    openai_client = openai.OpenAI(api_key=api_key)
+    completion_response = openai_client.chat.completions.create(
+        model=completion_model,
+        messages=[
+            {
+                "role": "system",
+                "content": f"""
+                    Instructions:
+
+                    - You are a helpful assistant whose goal is to answer user questions based on the provided context.
+                    - You can answer questions, provide explanations, and offer help, as long as the questions are relevant to the context.
+                    - If you are unable to answer the user's question, return the message: "I'm sorry, I don't know the answer to that question."
+                    - If the users question is not relevant to the context, return the message: "I'm sorry, I can't help with that question given the context provided." 
+                    
+                    Context: 
+                    
+                    {context}
+                """,
+            },
+            *previous_messages,
+            {"role": "user", "content": question},
+        ],
     )
-    if not response.ok:
-        logger.error(f"Failed to get related articles: {response.text}")
-        return []
-    response_data = response.json()
-    return response_data["articles"]
+    question_answer = {
+        "role": "assistant",
+        "content": completion_response.choices[0].message.content,
+    }
+    return question_answer
 
 
-def add_chat_message(role: str, content: str):
-    st.session_state.messages.append({"role": role, "content": content})
+def get_user_chats() -> dict:
+    user_chats_response = db_client.table("chats").select("*").execute()
+    user_chats_response_data = user_chats_response.data
+    user_chats = {chat["id"]: chat for chat in user_chats_response_data}
+    return user_chats
 
 
-def add_article(article_data: dict):
-    st.session_state.articles.append(article_data)
+def insert_new_chat(chat_data: dict) -> tuple[int, dict]:
+    insert_response = db_client.table("chats").insert([chat_data]).execute()
+    insert_response_data = insert_response.data[0]
+    chat_id = insert_response_data["id"]
+    return chat_id, chat_data
 
 
-app_config = {
-    "APP_NAME": "TLDR News",
-    "NEWSAPI_API_KEY": st.secrets["NEWSAPI_API_KEY"],
-    "CHAT_INPUT_PLACEHOLDER": "Enter a URL to summarise...",
-    "OPENAI_API_KEY": st.secrets["OPENAI_API_KEY"],
-    "OPENAI_COMPLETIONS_MODEL": st.secrets["OPENAI_COMPLETIONS_MODEL"],
-    "SUPABASE_PROJECT_URL": st.secrets["SUPABASE_PROJECT_URL"],
-    "SUPABASE_API_KEY": st.secrets["SUPABASE_API_KEY"],
-}
-st.title(app_config["APP_NAME"])
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "articles" not in st.session_state:
-    st.session_state.articles = []
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-if url := st.chat_input(app_config["CHAT_INPUT_PLACEHOLDER"]):
-    add_chat_message("user", url)
-    if not validators.url(url):
-        add_chat_message("assistant", "Please enter a valid URL.")
-        st.rerun()
-    with st.spinner(f"Getting article summary for '{url}'..."):
-        try:
-            article_data = get_article(url, app_config)
-        except:
-            add_chat_message(
-                "assistant",
-                "An error occurred while trying to get the article summary. Please try again later.",
-            )
+def update_user_chat(chat_id: str, update_data: dict):
+    db_client.table("chats").update(update_data).eq("id", chat_id).execute()
+
+
+def create_new_chat(url: str) -> str:
+    article_details = download_article(url)
+    new_chat_data = {
+        "title": article_details["title"],
+        "url": article_details["url"],
+        "text": article_details["text"],
+        "messages": [
+            {
+                "role": "assistant",
+                "content": f"Hey! What would you like to know about: **{article_details['title']}** ({url})?",
+            }
+        ],
+    }
+    chat_id, chat_data = insert_new_chat(new_chat_data)
+    st.session_state["chats"][chat_id] = chat_data
+    return chat_id
+
+
+def render_chat_message(role: str, content: str):
+    with st.chat_message(role):
+        st.markdown(content)
+
+
+def render_new_chat_view():
+    st.title(strings["NEW_CHAT_TITLE"])
+    if url := st.chat_input(strings["NEW_CHAT_INPUT_PLACEHOLDER"]):
+        if not validators.url(url):
+            st.error(strings["INVALID_URL_MESSAGE"])
+        else:
+            try:
+                new_chat_id = create_new_chat(url)
+            except Exception as e:
+                st.error(str(e))
+                return
+            set_active_chat(new_chat_id)
             st.rerun()
-    article_summary = article_data["summary"]
-    article_title = article_data["title"]
-    add_article(article_data)
-    add_chat_message("assistant", article_title + "\n" + article_summary)
-    st.rerun()
+
+
+def render_existing_chat_view(chat_id: str):
+    chat = st.session_state["chats"][chat_id]
+    st.title(chat["title"])
+    for message in chat["messages"]:
+        render_chat_message(message["role"], message["content"])
+    if question := st.chat_input(strings["CHAT_INPUT_PLACEHOLDER"]):
+        user_question = {
+            "role": "user",
+            "content": question,
+        }
+        render_chat_message(user_question["role"], user_question["content"])
+        response = generate_chat_completion(
+            context=chat["text"],
+            question=question,
+            api_key=app_config["OPENAI_API_KEY"],
+            completion_model=app_config["OPENAI_COMPLETIONS_MODEL"],
+            previous_messages=st.session_state["chats"][chat_id]["messages"],
+        )
+        render_chat_message(response["role"], response["content"])
+        st.session_state["chats"][chat_id]["messages"].extend([user_question, response])
+        update_user_chat(chat_id=chat_id, update_data={"messages": [*chat["messages"]]})
+
+
+def render_chat():
+    active_chat_id = st.session_state.get("active_chat_id")
+    if not active_chat_id:
+        render_new_chat_view()
+    else:
+        render_existing_chat_view(active_chat_id)
+
+
+def render_sidebar():
+    with st.sidebar:
+        st.title(strings["APP_NAME"])
+        st.write(strings["APP_DESCRIPTION"])
+        new_chat_button = st.button(
+            strings["NEW_CHAT_BUTTON_LABEL"],
+            use_container_width=True,
+        )
+        if new_chat_button:
+            st.session_state["active_chat_id"] = None
+        if len(st.session_state.get("chats", {})) > 0:
+            st.header(strings["RECENT_CHATS_HEADER"])
+            chat_history = st.session_state.get("chats", {})
+            for chat_id, chat in chat_history.items():
+                load_chat_button = st.button(
+                    chat["title"],
+                    use_container_width=True,
+                    key=chat_id,
+                )
+                if load_chat_button:
+                    set_active_chat(chat_id)
+
+
+def set_active_chat(chat_id: str):
+    st.session_state["active_chat_id"] = chat_id
+
+
+def get_session_state():
+    if "chats" not in st.session_state:
+        st.session_state["chats"] = get_user_chats()
+    if "active_chat_id" not in st.session_state:
+        st.session_state["active_chat_id"] = None
+
+
+def main():
+    get_session_state()
+    render_sidebar()
+    render_chat()
+
+
+if __name__ == "__main__":
+    main()
