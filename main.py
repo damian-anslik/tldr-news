@@ -4,30 +4,59 @@ import newspaper
 import datetime
 import supabase
 import requests
+import logging
 import openai
-import nltk
 import json
 
+logger = logging.getLogger(__name__)
 
-def generate_summary(article_text: str, model_config: dict) -> str:
+
+def parse_generated_summary(raw_response: str) -> dict:
+    response = raw_response.strip("`").replace("json", "").strip()
+    try:
+        return json.loads(response)
+    except:
+        return {}
+
+
+def generate_summary(article_text: str, article_title: str, model_config: dict) -> dict:
     openai_client = openai.OpenAI(api_key=model_config["OPENAI_API_KEY"])
-    system_prompt = """
-    Create a concise TLDR summary of a news article provided by the user. 
-    The user will paste the contents of the article, and you return a summary. 
-    The summary should be limited to 250 words. 
-    Remove any bias that may be present in the article, and only present the facts. 
-    Only include information pertaining to the topic at hand - information not relevant to the topic of the article should be omitted. 
-    The response should be formatted as a list of bullet points. 
-    Use proper English grammar and punctuation rules with sentences ending in a period.
-    """
+    with open("system_prompt.txt", "r") as f:
+        system_prompt = f.read()
     completion_response = openai_client.chat.completions.create(
         model=model_config["OPENAI_COMPLETIONS_MODEL"],
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": article_text},
+            {
+                "role": "user",
+                "content": json.dumps({"title": article_title, "text": article_text}),
+            },
         ],
     )
-    return completion_response.choices[0].message.content
+    formatted_completion_content = parse_generated_summary(
+        completion_response.choices[0].message.content
+    )
+    if not formatted_completion_content:
+        raise Exception(
+            f"Failed to generate summary: {completion_response.choices[0].message.content}"
+        )
+    return formatted_completion_content
+
+
+def download_article(url: str) -> dict:
+    article = newspaper.Article(url)
+    article.download()
+    article.parse()
+    filtered_keywords = [
+        "The Explainer",
+    ]
+    if any(keyword in article.text for keyword in filtered_keywords):
+        raise Exception("Article is not supported - contains filtered keywords.")
+    return {
+        "url": article.url,
+        "title": article.title,
+        "text": article.text,
+    }
 
 
 def get_article(url: str, app_config: dict) -> dict:
@@ -36,39 +65,40 @@ def get_article(url: str, app_config: dict) -> dict:
         supabase_key=app_config["SUPABASE_API_KEY"],
     )
     articles = db_client.table("articles")
+    existing_articles = articles.select("*").eq("url", url).execute()
+    if len(existing_articles.data) > 0:
+        return existing_articles.data[0]
+    model_config = {
+        "OPENAI_API_KEY": app_config["OPENAI_API_KEY"],
+        "OPENAI_COMPLETIONS_MODEL": app_config["OPENAI_COMPLETIONS_MODEL"],
+    }
     try:
-        article_data = articles.select("*").eq("url", url).single().execute().data
-    except:
-        model_config = {
-            "OPENAI_API_KEY": app_config["OPENAI_API_KEY"],
-            "OPENAI_COMPLETIONS_MODEL": app_config["OPENAI_COMPLETIONS_MODEL"],
-        }
-        article = newspaper.Article(url)
-        article.download()
-        article.parse()
-        article_summary = generate_summary(article.text, model_config)
-        article_data = {
-            "title": article.title,
-            "text": article.text,
-            "url": url,
-            "summary": article_summary,
-        }
-        if app_config["GET_RELATED_ARTICLES"]:
-            # Figure out how to best create a list of keywords from the article so we can get relevant related articles
-            nltk.download("punkt")
-            article.nlp()
-            article_keywords = article.keywords
-            # article_keywords = article.title.split(" ")
-            if not article.publish_date:
-                article.publish_date = datetime.datetime.now()
-            related_articles = get_related_articles(
-                article_keywords=article_keywords,
-                from_date=article.publish_date,
-                api_key=app_config["NEWSAPI_API_KEY"],
-            )
-            article_data["related_articles"] = related_articles
-        articles.insert(article_data).execute()
-    return article_data
+        article = download_article(url)
+    except Exception as e:
+        db_client.table("failing-articles").insert({"url": url}).execute()
+        logger.error(f"Failed to download article - {str(e)}")
+        raise
+    try:
+        generated_summary = generate_summary(
+            article_text=article["text"],
+            article_title=article["title"],
+            model_config=model_config,
+        )
+    except Exception as e:
+        logger.error(f"Failed to generate article summary - {str(e)}")
+        raise
+    inserted_article_data = {
+        **article,
+        "summary": generated_summary["summary"],
+    }
+    related_articles = get_related_articles(
+        article_keywords=generated_summary["keywords"],
+        from_date=datetime.datetime.now() - datetime.timedelta(hours=72),
+        api_key=app_config["NEWSAPI_API_KEY"],
+    )
+    inserted_article_data["related_articles"] = related_articles
+    articles.insert(inserted_article_data).execute()
+    return inserted_article_data
 
 
 def get_related_articles(
@@ -90,10 +120,9 @@ def get_related_articles(
         headers={"X-Api-Key": api_key},
     )
     if not response.ok:
-        raise Exception(f"Failed to get related articles: {response.text}")
+        logger.error(f"Failed to get related articles: {response.text}")
+        return []
     response_data = response.json()
-    with open("related_articles.json", "w") as f:
-        json.dump(response_data, f)
     return response_data["articles"]
 
 
@@ -107,7 +136,6 @@ def add_article(article_data: dict):
 
 app_config = {
     "APP_NAME": "TLDR News",
-    "GET_RELATED_ARTICLES": True,
     "NEWSAPI_API_KEY": st.secrets["NEWSAPI_API_KEY"],
     "CHAT_INPUT_PLACEHOLDER": "Enter a URL to summarise...",
     "OPENAI_API_KEY": st.secrets["OPENAI_API_KEY"],
